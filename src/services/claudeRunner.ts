@@ -22,13 +22,57 @@ function sanitize(text: string): string {
   return text.replace(LONE_SURROGATE, '\uFFFD');
 }
 
+/**
+ * Arm an *inactivity* timer for a session.
+ *
+ * `config.claudeTimeoutMs` used to be applied as a wall-clock cap on the whole
+ * run, so a session that was working perfectly well got aborted the moment it
+ * crossed the limit \u2014 long investigations died mid-tool-call for no reason.
+ * Now the timer is re-armed on every stream event (see `processQuery`), so the
+ * limit means "no activity for this long" and only a genuinely hung session is
+ * killed.
+ *
+ * Returns `touch` to re-arm the timer and `clear` to shut it down.
+ */
+function armIdleTimer(
+  session: Pick<ActiveSession, 'busy'>,
+  abortController: AbortController
+): { touch: () => void; clear: () => void } {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  const clear = (): void => {
+    if (timer) clearTimeout(timer);
+    timer = null;
+  };
+
+  const touch = (): void => {
+    clear();
+    timer = setTimeout(() => {
+      if (session.busy) abortController.abort();
+    }, config.claudeTimeoutMs);
+  };
+
+  touch();
+  return { touch, clear };
+}
+
 // Build a clean env object once at startup: exclude CLAUDECODE and any values
 // with unpaired Unicode surrogates.
-const cleanEnv: Record<string, string> = Object.fromEntries(
-  Object.entries(process.env).filter(
-    ([k, v]) => k !== 'CLAUDECODE' && v != null && !HAS_LONE_SURROGATE.test(v)
-  ) as [string, string][]
-);
+//
+// The Bash timeouts are set here rather than left to the SDK's defaults (2 min
+// default / 10 min ceiling), which are too short for this host and caused long
+// commands to be cut off mid-run.  Explicit values from config win over
+// whatever happened to be inherited, so the budget is the same whether the bot
+// was started by pm2, a shell or a launchd job.
+const cleanEnv: Record<string, string> = {
+  ...Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([k, v]) => k !== 'CLAUDECODE' && v != null && !HAS_LONE_SURROGATE.test(v)
+    ) as [string, string][]
+  ),
+  BASH_DEFAULT_TIMEOUT_MS: String(config.bashDefaultTimeoutMs),
+  BASH_MAX_TIMEOUT_MS: String(config.bashMaxTimeoutMs),
+};
 
 // Tools that are auto-approved (read-only, no side effects)
 const AUTO_APPROVED_TOOLS = [
@@ -132,6 +176,9 @@ async function processQuery(
   let resultData: { exitType: string; cost?: number; duration?: number; sessionId?: string } | null = null;
 
   for await (const message of q) {
+    // Any event means the session is alive — push the inactivity deadline out.
+    session.touch?.();
+
     if (message.type === 'system' && (message as any).subtype === 'init') {
       const sid = (message as any).session_id ?? null;
       if (sid) {
@@ -221,9 +268,8 @@ export async function runClaude(
 
   activeSessions.set(thread.id, session);
 
-  const timeout = setTimeout(() => {
-    if (session.busy) abortController.abort();
-  }, config.claudeTimeoutMs);
+  const idle = armIdleTimer(session, abortController);
+  session.touch = idle.touch;
 
   const safePrompt = sanitize(prompt);
   const resolvedModel = resolveModel(model, projectName);
@@ -268,15 +314,14 @@ export async function runClaude(
       updateProjectSession(projectName, '');
       streamer.append('\n⚠️ Session history corrupted — starting fresh session\n');
 
-      // Clear the original timeout and set a new one for the retry
-      clearTimeout(timeout);
+      // Stop the original idle timer and arm a fresh one for the retry
+      idle.clear();
       const freshAbort = new AbortController();
-      const freshTimeout = setTimeout(() => {
-        if (session.busy) freshAbort.abort();
-      }, config.claudeTimeoutMs);
+      const freshIdle = armIdleTimer(session, freshAbort);
 
       try {
         session.abortController = freshAbort;
+        session.touch = freshIdle.touch;
         session.busy = true;
         const freshQ = query({
           prompt: safePrompt,
@@ -301,7 +346,7 @@ export async function runClaude(
         await setThreadName(thread, `❌ ${threadLabel(prompt)}`);
         try { await originalMessage.react('❌'); } catch {}
       } finally {
-        clearTimeout(freshTimeout);
+        freshIdle.clear();
       }
     } else {
       streamer.append(`\n[error] ${msg}\n`);
@@ -310,7 +355,7 @@ export async function runClaude(
       try { await originalMessage.react('❌'); } catch {}
     }
   } finally {
-    clearTimeout(timeout);
+    idle.clear();
   }
 }
 
@@ -351,9 +396,8 @@ export async function runClaudeInThread(
 
   activeSessions.set(threadId, session);
 
-  const timeout = setTimeout(() => {
-    if (session.busy) abortController.abort();
-  }, config.claudeTimeoutMs);
+  const idle = armIdleTimer(session, abortController);
+  session.touch = idle.touch;
 
   const safePrompt = sanitize(prompt);
   const resolvedModel = resolveModel(model, projectName);
@@ -387,7 +431,7 @@ export async function runClaudeInThread(
     }
     return null;
   } finally {
-    clearTimeout(timeout);
+    idle.clear();
   }
 }
 
@@ -441,9 +485,8 @@ export async function continueInThread(
 
   activeSessions.set(threadId, activeSession);
 
-  const timeout = setTimeout(() => {
-    if (activeSession.busy) abortController.abort();
-  }, config.claudeTimeoutMs);
+  const idle = armIdleTimer(activeSession, abortController);
+  activeSession.touch = idle.touch;
 
   const safePrompt = sanitize(prompt);
   const resolvedModel = resolveModel(model, projectName);
@@ -479,7 +522,7 @@ export async function continueInThread(
       await setThreadName(thread, `❌ ${currentName}`);
     }
   } finally {
-    clearTimeout(timeout);
+    idle.clear();
   }
 }
 
