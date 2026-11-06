@@ -22,5 +22,12 @@ export interface ActiveSession {
   sessionId: string | null;
   startedAt: number;
   busy: boolean; // Currently processing a query
+  /**
+   * Re-arms the inactivity timer. Called on every stream event so that a
+   * session which is actively making progress is never aborted; only a
+   * genuinely stalled one (no events for claudeTimeoutMs) gets killed.
+   * Set by the runner that owns the timer.
+   */
+  touch?: () => void;
 }
 
